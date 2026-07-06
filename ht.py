@@ -38,9 +38,25 @@ REQUIRED_COLUMNS = [
     "Alarm KPI Group",
 ]
 
-DATETIME_COLUMNS = ["Start Time", "End Time", "Acknowledged Time"]
+# Define column name variations (with and without spaces)
+COLUMN_VARIATIONS = {
+    "Rms Station": ["RmsStation", "RMS Station", "RMSStation"],
+    "Site": ["Site"],
+    "Site Alias": ["SiteAlias", "Site Alias", "Site_Alias"],
+    "Zone": ["Zone"],
+    "Cluster": ["Cluster"],
+    "Tenant": ["Tenant"],
+    "Tag": ["Tag"],
+    "Start Time": ["StartTime", "Start Time", "Start_Time"],
+    "End Time": ["EndTime", "End Time", "End_Time"],
+    "Elapsed Time": ["ElapsedTime", "Elapsed Time", "Elapsed_Time"],
+    "Duration (Hr.)": ["Duration(Hr.)", "Duration (Hr.)", "Duration_Hr"],
+    "Acknowledged Time": ["AcknowledgedTime", "Acknowledged Time", "Acknowledged_Time"],
+    "Acknowledged By": ["AcknowledgedBy", "Acknowledged By", "Acknowledged_By"],
+    "Alarm KPI Group": ["AlarmKPI Group", "Alarm KPI Group", "KPIGroup", "KPI Group"],
+}
 
-MAX_MF_COLUMNS_IN_SUMMARY_PREVIEW = 3  # how many MF events to preview inline in the app table
+DATETIME_COLUMNS = ["Start Time", "End Time", "Acknowledged Time"]
 
 st.set_page_config(
     page_title="RMS Alarm Comparator",
@@ -91,9 +107,9 @@ def load_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
         )
         st.stop()
 
-    # Clean column names: strip whitespace, normalize spaces, handle case
+    # Clean column names: strip whitespace, normalize spaces
     df.columns = [
-        str(c).strip().replace("  ", " ").replace("\n", " ")  # Remove extra spaces and newlines
+        str(c).strip().replace("  ", " ").replace("\n", " ")
         for c in df.columns
     ]
     
@@ -101,26 +117,33 @@ def load_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------
-# Column name normalization helper
+# Column name normalization helper (improved)
 # --------------------------------------------------------------------------
 
-def normalize_column_names(df: pd.DataFrame, required_columns: List[str]) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """Find and map actual column names to required column names (case-insensitive).
+def normalize_column_names(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """
+    Map actual column names to the standard required column names.
+    Handles variations with and without spaces, case differences, etc.
     
     Returns:
     - df: DataFrame with columns renamed to match required names (where found)
     - mapping: Dict mapping required_name -> actual_name found in the file
     """
-    # Create a mapping of lowercase column names to original names
-    col_map = {str(c).lower(): c for c in df.columns}
+    # Create reverse mapping: variation -> standard name
+    variation_to_standard = {}
+    for standard, variations in COLUMN_VARIATIONS.items():
+        for var in variations:
+            variation_to_standard[var.lower()] = standard
     
+    # Map actual columns to standard names
     mapping = {}
-    for req_col in required_columns:
-        req_lower = req_col.lower()
-        if req_lower in col_map:
-            mapping[req_col] = col_map[req_lower]
+    for col in df.columns:
+        col_clean = col.lower().strip()
+        if col_clean in variation_to_standard:
+            standard_name = variation_to_standard[col_clean]
+            mapping[standard_name] = col
     
-    # Rename columns to match required names
+    # Rename columns to standard names
     df_renamed = df.rename(columns={v: k for k, v in mapping.items()})
     
     return df_renamed, mapping
@@ -456,8 +479,8 @@ def render_validation(rt_df: pd.DataFrame, mf_df: pd.DataFrame) -> bool:
     ok = True
     
     # Normalize column names
-    rt_df_norm, rt_mapping = normalize_column_names(rt_df, REQUIRED_COLUMNS)
-    mf_df_norm, mf_mapping = normalize_column_names(mf_df, REQUIRED_COLUMNS)
+    rt_df_norm, rt_mapping = normalize_column_names(rt_df)
+    mf_df_norm, mf_mapping = normalize_column_names(mf_df)
     
     # Check for missing columns after normalization
     missing_rt = validate_columns(rt_df_norm, REQUIRED_COLUMNS)
@@ -467,18 +490,23 @@ def render_validation(rt_df: pd.DataFrame, mf_df: pd.DataFrame) -> bool:
         # Show helpful message with detected columns
         detected_cols = list(rt_df.columns)
         st.error(f"❌ Room Temperature file is missing required columns: {', '.join(missing_rt)}")
-        st.info(f"📋 Detected columns in RT file: {', '.join(detected_cols[:20])}{'...' if len(detected_cols) > 20 else ''}")
+        st.info(f"📋 Detected columns in RT file: {', '.join(detected_cols)}")
         ok = False
     else:
-        st.success(f"✅ Room Temperature file contains all required columns (mapped from: {', '.join(rt_mapping.values())})")
+        st.success(f"✅ Room Temperature file contains all required columns")
+        # Show mapping
+        mapping_str = ", ".join([f"{k} ← {v}" for k, v in rt_mapping.items()])
+        st.caption(f"📋 Column mapping: {mapping_str}")
     
     if missing_mf:
         detected_cols = list(mf_df.columns)
         st.error(f"❌ Mains Fail file is missing required columns: {', '.join(missing_mf)}")
-        st.info(f"📋 Detected columns in MF file: {', '.join(detected_cols[:20])}{'...' if len(detected_cols) > 20 else ''}")
+        st.info(f"📋 Detected columns in MF file: {', '.join(detected_cols)}")
         ok = False
     else:
-        st.success(f"✅ Mains Fail file contains all required columns (mapped from: {', '.join(mf_mapping.values())})")
+        st.success(f"✅ Mains Fail file contains all required columns")
+        mapping_str = ", ".join([f"{k} ← {v}" for k, v in mf_mapping.items()])
+        st.caption(f"📋 Column mapping: {mapping_str}")
 
     # Return normalized dataframes via session state for later use
     if ok:
