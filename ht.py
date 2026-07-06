@@ -10,7 +10,6 @@ Author: Generated for RMS Alarm Analysis
 """
 
 import io
-import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -52,100 +51,79 @@ st.set_page_config(
 
 
 # --------------------------------------------------------------------------
-# Data loading
+# Data loading with robust column name handling
 # --------------------------------------------------------------------------
-
-def _normalize_col_name(name: object) -> str:
-    """Normalize a column name for robust matching: collapse all whitespace
-    (including non-breaking spaces, tabs, newlines), strip, and lowercase.
-    This makes matching insensitive to things like 'Rms  Station',
-    'RMS STATION', 'Rms Station ' or 'Duration(Hr.)' vs 'Duration (Hr.)'.
-    """
-    text = str(name)
-    text = text.replace("\xa0", " ")  # non-breaking space
-    text = re.sub(r"\s+", " ", text).strip().lower()
-    # also collapse "duration (hr.)" vs "duration(hr.)" style spacing differences
-    text = re.sub(r"\s*([().])\s*", r"\1", text)
-    return text
-
-
-# Precompute normalized lookup: normalized name -> canonical required column name
-_REQUIRED_NORMALIZED_MAP = {_normalize_col_name(c): c for c in REQUIRED_COLUMNS}
-
-
-def _detect_header_row(buffer: io.BytesIO, engine: str, max_rows_to_check: int = 10) -> int:
-    """Scan the first few rows of the sheet to find which row looks like the
-    real header row (i.e. best matches the required column names). This
-    handles files that have a title/banner row above the actual header.
-    """
-    buffer.seek(0)
-    try:
-        raw = pd.read_excel(buffer, engine=engine, header=None, nrows=max_rows_to_check)
-    except Exception:
-        return 0
-
-    best_row = 0
-    best_score = -1
-    for i in range(len(raw)):
-        row_values = raw.iloc[i].tolist()
-        normalized_row = {_normalize_col_name(v) for v in row_values if pd.notna(v)}
-        score = len(normalized_row & set(_REQUIRED_NORMALIZED_MAP.keys()))
-        if score > best_score:
-            best_score = score
-            best_row = i
-    return best_row
-
-
-def _canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename any column that matches a required column (after normalization)
-    to its exact canonical name, leaving other/extra columns untouched
-    (just whitespace-stripped).
-    """
-    rename_map = {}
-    for col in df.columns:
-        normalized = _normalize_col_name(col)
-        if normalized in _REQUIRED_NORMALIZED_MAP:
-            rename_map[col] = _REQUIRED_NORMALIZED_MAP[normalized]
-        else:
-            rename_map[col] = str(col).strip()
-    return df.rename(columns=rename_map)
-
 
 @st.cache_data(show_spinner=False)
 def load_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     """Load an Excel file (as raw bytes, for cache-friendliness) into a DataFrame.
-
-    Automatically detects the header row (in case there's a title/banner row
-    above the real headers) and normalizes column names so that differences
-    in spacing/casing don't cause false "missing column" errors.
-
-    Parameters
-    ----------
-    file_bytes: raw bytes of the uploaded Excel file
-    file_name: original file name (used only to pick the right engine)
-
-    Returns
-    -------
-    pd.DataFrame
+    
+    Handles:
+    - Column names starting from row 0 or row 1
+    - Extra spaces in column names
+    - Case-insensitive column matching
     """
+    buffer = io.BytesIO(file_bytes)
     is_legacy_xls = file_name.lower().endswith(".xls") and not file_name.lower().endswith(".xlsx")
     engine = "xlrd" if is_legacy_xls else "openpyxl"
 
     try:
-        header_row = _detect_header_row(io.BytesIO(file_bytes), engine)
-        df = pd.read_excel(io.BytesIO(file_bytes), engine=engine, header=header_row)
-    except ImportError:
+        # First, try reading with header in row 0 (default)
+        df = pd.read_excel(buffer, engine=engine, header=0)
+        
+        # Check if first row looks like data (not column names)
+        # If the first row contains numeric values or dates, it might be data
+        first_row = df.iloc[0] if len(df) > 0 else pd.Series()
+        
+        # If the first row contains mostly non-string values, the header might be in row 1
+        string_count = sum(isinstance(val, str) for val in first_row.values if pd.notna(val))
+        total_non_empty = sum(pd.notna(val) for val in first_row.values)
+        
+        if total_non_empty > 0 and string_count / total_non_empty < 0.3:
+            # First row looks like data, try reading with header in row 1
+            buffer.seek(0)
+            df = pd.read_excel(buffer, engine=engine, header=1)
+            
+    except Exception as exc:
         st.error(
-            f"❌ Missing required Excel engine package: **{engine}**.\n\n"
-            f"Add the following to your `requirements.txt` and redeploy:\n\n"
-            f"```\nopenpyxl>=3.1.0\nxlrd>=2.0.1\n```"
+            f"❌ Error reading Excel file: {exc}\n\n"
+            f"Please ensure the file is a valid Excel file with column names in the first row."
         )
         st.stop()
 
-    df = _canonicalize_columns(df)
-    # Drop fully-empty "Unnamed" columns that sometimes trail a sheet
-    df = df.loc[:, ~(df.columns.astype(str).str.match(r"^Unnamed") & df.isna().all())]
+    # Clean column names: strip whitespace, normalize spaces, handle case
+    df.columns = [
+        str(c).strip().replace("  ", " ").replace("\n", " ")  # Remove extra spaces and newlines
+        for c in df.columns
+    ]
+    
     return df
+
+
+# --------------------------------------------------------------------------
+# Column name normalization helper
+# --------------------------------------------------------------------------
+
+def normalize_column_names(df: pd.DataFrame, required_columns: List[str]) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Find and map actual column names to required column names (case-insensitive).
+    
+    Returns:
+    - df: DataFrame with columns renamed to match required names (where found)
+    - mapping: Dict mapping required_name -> actual_name found in the file
+    """
+    # Create a mapping of lowercase column names to original names
+    col_map = {str(c).lower(): c for c in df.columns}
+    
+    mapping = {}
+    for req_col in required_columns:
+        req_lower = req_col.lower()
+        if req_lower in col_map:
+            mapping[req_col] = col_map[req_lower]
+    
+    # Rename columns to match required names
+    df_renamed = df.rename(columns={v: k for k, v in mapping.items()})
+    
+    return df_renamed, mapping
 
 
 # --------------------------------------------------------------------------
@@ -153,16 +131,9 @@ def load_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 def validate_columns(df: pd.DataFrame, required_columns: List[str]) -> List[str]:
-    """Return the list of required columns that are missing from df.
-    Matching is whitespace/case-insensitive (columns are already canonicalized
-    by load_excel, but this is checked again here as a safety net in case a
-    DataFrame is validated without going through load_excel).
-    """
-    present_normalized = {_normalize_col_name(c) for c in df.columns}
-    return [
-        c for c in required_columns
-        if _normalize_col_name(c) not in present_normalized
-    ]
+    """Return the list of required columns that are missing from df."""
+    present = set(df.columns)
+    return [c for c in required_columns if c not in present]
 
 
 # --------------------------------------------------------------------------
@@ -483,30 +454,37 @@ def render_upload_section() -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFra
 
 def render_validation(rt_df: pd.DataFrame, mf_df: pd.DataFrame) -> bool:
     ok = True
-
-    missing_rt = validate_columns(rt_df, REQUIRED_COLUMNS)
-    missing_mf = validate_columns(mf_df, REQUIRED_COLUMNS)
+    
+    # Normalize column names
+    rt_df_norm, rt_mapping = normalize_column_names(rt_df, REQUIRED_COLUMNS)
+    mf_df_norm, mf_mapping = normalize_column_names(mf_df, REQUIRED_COLUMNS)
+    
+    # Check for missing columns after normalization
+    missing_rt = validate_columns(rt_df_norm, REQUIRED_COLUMNS)
+    missing_mf = validate_columns(mf_df_norm, REQUIRED_COLUMNS)
 
     if missing_rt:
+        # Show helpful message with detected columns
+        detected_cols = list(rt_df.columns)
         st.error(f"❌ Room Temperature file is missing required columns: {', '.join(missing_rt)}")
+        st.info(f"📋 Detected columns in RT file: {', '.join(detected_cols[:20])}{'...' if len(detected_cols) > 20 else ''}")
         ok = False
+    else:
+        st.success(f"✅ Room Temperature file contains all required columns (mapped from: {', '.join(rt_mapping.values())})")
+    
     if missing_mf:
+        detected_cols = list(mf_df.columns)
         st.error(f"❌ Mains Fail file is missing required columns: {', '.join(missing_mf)}")
+        st.info(f"📋 Detected columns in MF file: {', '.join(detected_cols[:20])}{'...' if len(detected_cols) > 20 else ''}")
         ok = False
+    else:
+        st.success(f"✅ Mains Fail file contains all required columns (mapped from: {', '.join(mf_mapping.values())})")
 
-    if not ok:
-        with st.expander("🔎 Show detected column names (for debugging)"):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write("**Room Temperature file columns:**")
-                st.write(list(rt_df.columns))
-            with c2:
-                st.write("**Mains Fail file columns:**")
-                st.write(list(mf_df.columns))
-
+    # Return normalized dataframes via session state for later use
     if ok:
-        st.success("✅ Both files contain all required columns.")
-
+        st.session_state['rt_df_norm'] = rt_df_norm
+        st.session_state['mf_df_norm'] = mf_df_norm
+    
     return ok
 
 
@@ -575,11 +553,16 @@ def main():
     st.markdown("---")
     st.subheader("✅ Validation")
     if not render_validation(rt_df_raw, mf_df_raw):
+        st.stop()
         return
 
+    # Use normalized dataframes from session state
+    rt_df = st.session_state['rt_df_norm']
+    mf_df = st.session_state['mf_df_norm']
+
     with st.spinner("Converting date/time columns..."):
-        rt_df, rt_issues = preprocess_dataframe(rt_df_raw, "RT")
-        mf_df, mf_issues = preprocess_dataframe(mf_df_raw, "MF")
+        rt_df, rt_issues = preprocess_dataframe(rt_df, "RT")
+        mf_df, mf_issues = preprocess_dataframe(mf_df, "MF")
 
     dropped_rt = rt_issues.get("RT_dropped_rows", 0)
     dropped_mf = mf_issues.get("MF_dropped_rows", 0)
