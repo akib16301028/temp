@@ -1,551 +1,180 @@
-"""
-RMS Alarm History Comparator
-=============================
-
-A Streamlit application that compares "Room Temperature" alarm events against
-"Mains Fail" alarm events for the same Site (or Site Alias), based on
-overlapping time intervals rather than exact timestamp matches.
-
-Author: Generated for RMS Alarm Analysis
-"""
-
-import io
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+from io import BytesIO
+import datetime
 
-# --------------------------------------------------------------------------
 # Constants
-# --------------------------------------------------------------------------
+REQUIRED_COLS_RT = ['Rms Station', 'Site', 'Site Alias', 'Zone', 'Cluster', 'Tenant', 'Tag', 'Start Time', 'End Time', 'Elapsed Time', 'Duration (Hr.)', 'Acknowledged Time', 'Acknowledged By', 'Alarm KPI Group']
+REQUIRED_COLS_MF = same? Actually both have same columns, so we can use same list for validation.
 
-REQUIRED_COLUMNS = [
-    "Rms Station",
-    "Site",
-    "Site Alias",
-    "Zone",
-    "Cluster",
-    "Tenant",
-    "Tag",
-    "Start Time",
-    "End Time",
-    "Elapsed Time",
-    "Duration (Hr.)",
-    "Acknowledged Time",
-    "Acknowledged By",
-    "Alarm KPI Group",
-]
+def load_excel(uploaded_file):
+    return pd.read_excel(uploaded_file)
 
-DATETIME_COLUMNS = ["Start Time", "End Time", "Acknowledged Time"]
+def validate_columns(df, required_cols):
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
 
-MAX_MF_COLUMNS_IN_SUMMARY_PREVIEW = 3  # how many MF events to preview inline in the app table
-
-st.set_page_config(
-    page_title="RMS Alarm Comparator",
-    page_icon="🛰️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-
-# --------------------------------------------------------------------------
-# Data loading
-# --------------------------------------------------------------------------
-
-@st.cache_data(show_spinner=False)
-def load_excel(file_bytes: bytes, file_name: str) -> pd.DataFrame:
-    """Load an Excel file (as raw bytes, for cache-friendliness) into a DataFrame.
-
-    Parameters
-    ----------
-    file_bytes: raw bytes of the uploaded Excel file
-    file_name: original file name (used only to pick the right engine)
-
-    Returns
-    -------
-    pd.DataFrame
-    """
-    buffer = io.BytesIO(file_bytes)
-    engine = "openpyxl" if file_name.lower().endswith((".xlsx", ".xlsm")) else None
-    df = pd.read_excel(buffer, engine=engine)
-    # Normalize column names (strip whitespace) without changing casing/meaning
-    df.columns = [str(c).strip() for c in df.columns]
+def convert_datetimes(df, cols):
+    for col in cols:
+        df[col] = pd.to_datetime(df[col], errors='coerce')
     return df
 
-
-# --------------------------------------------------------------------------
-# Validation
-# --------------------------------------------------------------------------
-
-def validate_columns(df: pd.DataFrame, required_columns: List[str]) -> List[str]:
-    """Return the list of required columns that are missing from df."""
-    present = set(df.columns)
-    return [c for c in required_columns if c not in present]
-
-
-# --------------------------------------------------------------------------
-# Preprocessing
-# --------------------------------------------------------------------------
-
-def to_hours(series: pd.Series) -> pd.Series:
-    """Best-effort conversion of a 'Duration' column to numeric hours.
-
-    Handles:
-      - already-numeric hour values
-      - timedelta strings like 'HH:MM:SS' or 'D days HH:MM:SS'
-      - pandas Timedelta objects
-    Unparseable values become NaN.
-    """
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.notna().mean() > 0.9:
-        # Overwhelmingly numeric already -> treat as hours directly
-        return numeric
-
-    # Fall back to timedelta parsing
-    td = pd.to_timedelta(series.astype(str), errors="coerce")
-    hours = td.dt.total_seconds() / 3600.0
-    # Keep any values that were numeric but timedelta parse failed
-    hours = hours.fillna(numeric)
-    return hours
-
-
-def preprocess_dataframe(df: pd.DataFrame, label: str) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    """Convert datetime and duration columns; return cleaned df plus a report
-    of how many rows failed to parse in each column (for user warnings).
-    """
-    df = df.copy()
-    parse_issues: Dict[str, int] = {}
-
-    for col in DATETIME_COLUMNS:
-        if col in df.columns:
-            before_na = df[col].isna().sum()
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-            after_na = df[col].isna().sum()
-            parse_issues[col] = int(after_na - before_na)
-
-    if "Duration (Hr.)" in df.columns:
-        before_na = df["Duration (Hr.)"].isna().sum()
-        df["Duration (Hr.)"] = to_hours(df["Duration (Hr.)"])
-        after_na = df["Duration (Hr.)"].isna().sum()
-        parse_issues["Duration (Hr.)"] = int(after_na - before_na)
-
-    # Drop rows where Start Time or End Time could not be parsed at all,
-    # since they cannot participate in overlap comparison.
-    if "Start Time" in df.columns and "End Time" in df.columns:
-        invalid_mask = df["Start Time"].isna() | df["End Time"].isna()
-        parse_issues[f"{label}_dropped_rows"] = int(invalid_mask.sum())
-        df = df.loc[~invalid_mask].reset_index(drop=True)
-
-    return df, parse_issues
-
-
-# --------------------------------------------------------------------------
-# Overlap comparison (vectorized per-site, no nested O(n*m) loops)
-# --------------------------------------------------------------------------
-
-def build_mf_lookup(mf_df: pd.DataFrame, site_key: str) -> Dict[str, Dict[str, np.ndarray]]:
-    """Pre-group Mains Fail events by site key and build a per-site IntervalIndex
-    so overlap queries per Room Temperature event are cheap and vectorized
-    (no python-level nested loop over the full cross product of both files).
-    """
-    lookup: Dict[str, Dict[str, np.ndarray]] = {}
-
-    for site_value, grp in mf_df.groupby(site_key, dropna=False):
-        grp = grp.loc[grp["Start Time"] <= grp["End Time"]].reset_index(drop=True)
-        if grp.empty:
-            continue
-
-        starts = grp["Start Time"].values
-        ends = grp["End Time"].values
-        interval_index = pd.IntervalIndex.from_arrays(starts, ends, closed="both")
-
-        lookup[site_value] = {
-            "interval_index": interval_index,
-            "starts": starts,
-            "ends": ends,
-            "durations": grp["Duration (Hr.)"].values if "Duration (Hr.)" in grp.columns else np.full(len(grp), np.nan),
-        }
-
-    return lookup
-
-
-def _merge_intervals(intervals: List[Tuple[pd.Timestamp, pd.Timestamp]]) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
-    """Merge overlapping (start, end) intervals to avoid double-counting
-    overlap duration when several Mains Fail events overlap one another.
-    """
+def compute_union_overlap(intervals):
+    # intervals: list of (start, end) as Timestamp
     if not intervals:
-        return []
-    intervals = sorted(intervals, key=lambda x: x[0])
-    merged = [intervals[0]]
-    for start, end in intervals[1:]:
-        last_start, last_end = merged[-1]
-        if start <= last_end:
-            merged[-1] = (last_start, max(last_end, end))
+        return pd.Timedelta(0)
+    sorted_intervals = sorted(intervals, key=lambda x: x[0])
+    merged = []
+    for start, end in sorted_intervals:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
         else:
-            merged.append((start, end))
-    return merged
+            merged[-1][1] = max(merged[-1][1], end)
+    total = sum((end - start).total_seconds() for start, end in merged) / 3600.0  # hours
+    return total
 
-
-def compare_alarms(
-    rt_df: pd.DataFrame,
-    mf_df: pd.DataFrame,
-    site_key: str = "Site",
-    progress_callback=None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Core comparison engine.
-
-    For each Room Temperature (RT) event, find all Mains Fail (MF) events for
-    the same site whose interval overlaps the RT event's interval.
-
-    Returns
-    -------
-    summary_df : one row per RT event with aggregate overlap info
-    detail_df  : one row per (RT event, overlapping MF event) pair
-    """
-    mf_lookup = build_mf_lookup(mf_df, site_key)
-
+def perform_overlap(rt_df, mf_df, match_col):
+    # rt_df and mf_df already have datetime columns converted
+    # We'll create a copy to avoid modifying original
+    rt = rt_df.copy()
+    mf = mf_df.copy()
+    
+    # We'll assign a unique index to RT events
+    rt['rt_id'] = range(len(rt))
+    # For grouping, we'll use the match_col
+    # Ensure both have that column
+    if match_col not in rt.columns or match_col not in mf.columns:
+        raise ValueError(f"Column '{match_col}' not found in both dataframes.")
+    
+    # Group by match_col
+    groups_rt = rt.groupby(match_col)
+    groups_mf = mf.groupby(match_col)
+    
+    # Prepare lists to accumulate summary rows and detail rows
     summary_rows = []
     detail_rows = []
-
-    total = len(rt_df)
-    step = max(total // 100, 1)
-
-    rt_records = rt_df.to_dict("records")
-
-    for i, rt in enumerate(rt_records):
-        site_value = rt.get(site_key)
-        rt_start = rt["Start Time"]
-        rt_end = rt["End Time"]
-
-        base_info = {
-            "Rms Station": rt.get("Rms Station"),
-            "Site": rt.get("Site"),
-            "Site Alias": rt.get("Site Alias"),
-            "Zone": rt.get("Zone"),
-            "Cluster": rt.get("Cluster"),
-            "Tenant": rt.get("Tenant"),
-            "Room Temperature Start Time": rt_start,
-            "Room Temperature End Time": rt_end,
-            "Room Temperature Duration (Hr.)": rt.get("Duration (Hr.)"),
-        }
-
-        mf_group = mf_lookup.get(site_value)
-        overlap_intervals = []
-        count = 0
-
-        if mf_group is not None and rt_start <= rt_end:
-            query_interval = pd.Interval(rt_start, rt_end, closed="both")
-            overlap_mask = mf_group["interval_index"].overlaps(query_interval)
-
-            if overlap_mask.any():
-                idxs = np.nonzero(overlap_mask)[0]
-                count = len(idxs)
-
-                for idx in idxs:
-                    mf_start = pd.Timestamp(mf_group["starts"][idx])
-                    mf_end = pd.Timestamp(mf_group["ends"][idx])
-                    mf_duration = mf_group["durations"][idx]
-
-                    clipped_start = max(rt_start, mf_start)
-                    clipped_end = min(rt_end, mf_end)
-                    overlap_intervals.append((clipped_start, clipped_end))
-
-                    detail_rows.append(
-                        {
-                            **base_info,
-                            "Mains Fail Start Time": mf_start,
-                            "Mains Fail End Time": mf_end,
-                            "Mains Fail Duration (Hr.)": mf_duration,
-                            "Overlap Start Time": clipped_start,
-                            "Overlap End Time": clipped_end,
-                            "Overlap Duration (Hr.)": (clipped_end - clipped_start).total_seconds() / 3600.0,
-                        }
-                    )
-
-        merged = _merge_intervals(overlap_intervals)
-        total_overlap_hours = sum((e - s).total_seconds() for s, e in merged) / 3600.0
-
-        rt_duration_hours = rt.get("Duration (Hr.)")
-        if rt_duration_hours is None or (isinstance(rt_duration_hours, float) and np.isnan(rt_duration_hours)):
-            rt_duration_hours = (rt_end - rt_start).total_seconds() / 3600.0
-
-        pct_covered = (
-            (total_overlap_hours / rt_duration_hours * 100.0)
-            if rt_duration_hours and rt_duration_hours > 0
-            else np.nan
-        )
-        pct_covered = min(pct_covered, 100.0) if pd.notna(pct_covered) else pct_covered
-
-        summary_rows.append(
-            {
-                **base_info,
-                "Mains Fail Occurred": "Yes" if count > 0 else "No",
-                "Mains Fail Event Count": count,
-                "Total Overlapping Mains Fail Duration (Hr.)": round(total_overlap_hours, 4),
-                "Percentage of RT Duration Covered (%)": round(pct_covered, 2) if pd.notna(pct_covered) else np.nan,
-            }
-        )
-
-        if progress_callback and (i % step == 0 or i == total - 1):
-            progress_callback((i + 1) / total)
-
-    summary_df = pd.DataFrame(summary_rows)
-    detail_df = pd.DataFrame(detail_rows)
-
-    return summary_df, detail_df
-
-
-# --------------------------------------------------------------------------
-# Filtering
-# --------------------------------------------------------------------------
-
-def apply_filters(
-    df: pd.DataFrame,
-    zones: List[str],
-    clusters: List[str],
-    tenants: List[str],
-    sites: List[str],
-    search_text: str,
-) -> pd.DataFrame:
-    filtered = df.copy()
-
-    if zones:
-        filtered = filtered[filtered["Zone"].isin(zones)]
-    if clusters:
-        filtered = filtered[filtered["Cluster"].isin(clusters)]
-    if tenants:
-        filtered = filtered[filtered["Tenant"].isin(tenants)]
-    if sites:
-        filtered = filtered[filtered["Site"].isin(sites)]
-    if search_text:
-        text = search_text.strip().lower()
-        mask = (
-            filtered["Site"].astype(str).str.lower().str.contains(text, na=False)
-            | filtered["Site Alias"].astype(str).str.lower().str.contains(text, na=False)
-        )
-        filtered = filtered[mask]
-
-    return filtered
-
-
-# --------------------------------------------------------------------------
-# Excel export
-# --------------------------------------------------------------------------
-
-def to_excel_bytes(summary_df: pd.DataFrame, detail_df: pd.DataFrame) -> bytes:
-    """Export the summary and detail tables to a multi-sheet Excel workbook,
-    with light formatting for readability.
-    """
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary_export = summary_df.copy()
-        for col in ["Room Temperature Start Time", "Room Temperature End Time"]:
-            if col in summary_export.columns:
-                parsed = pd.to_datetime(summary_export[col])
-                if getattr(parsed.dt, "tz", None) is not None:
-                    parsed = parsed.dt.tz_localize(None)
-                summary_export[col] = parsed
-        summary_export.to_excel(writer, sheet_name="Summary", index=False)
-
-        if not detail_df.empty:
-            detail_export = detail_df.copy()
-            detail_export.to_excel(writer, sheet_name="Overlap Details", index=False)
+    
+    # Get all match_col values present in RT
+    rt_values = set(rt[match_col].unique())
+    # We'll process each value
+    total_groups = len(rt_values)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, value in enumerate(rt_values):
+        status_text.text(f"Processing group {idx+1}/{total_groups}: {value}")
+        rt_group = groups_rt.get_group(value) if value in groups_rt.groups else pd.DataFrame()
+        mf_group = groups_mf.get_group(value) if value in groups_mf.groups else pd.DataFrame()
+        
+        if rt_group.empty:
+            continue
+        
+        # For RT events in this group, we need to determine overlaps
+        if mf_group.empty:
+            # No MF events for this site, all RT events have no overlap
+            for _, row in rt_group.iterrows():
+                summary_rows.append({
+                    'rt_id': row['rt_id'],
+                    'MF Occurred': 'No',
+                    'MF Count': 0,
+                    'Total Overlap Duration (Hr.)': 0,
+                    'Coverage %': 0,
+                })
+            # No detail rows
         else:
-            pd.DataFrame(
-                columns=[
-                    "Rms Station", "Site", "Site Alias", "Zone", "Cluster", "Tenant",
-                    "Room Temperature Start Time", "Room Temperature End Time",
-                    "Mains Fail Start Time", "Mains Fail End Time", "Mains Fail Duration (Hr.)",
-                ]
-            ).to_excel(writer, sheet_name="Overlap Details", index=False)
-
-        # Auto-fit column widths (approximate)
-        for sheet_name in writer.sheets:
-            worksheet = writer.sheets[sheet_name]
-            df_for_width = summary_export if sheet_name == "Summary" else detail_df
-            for i, col in enumerate(df_for_width.columns, start=1):
-                max_len = max(
-                    df_for_width[col].astype(str).map(len).max() if not df_for_width.empty else 0,
-                    len(str(col)),
-                ) + 2
-                worksheet.column_dimensions[worksheet.cell(row=1, column=i).column_letter].width = min(max_len, 40)
-
-    return output.getvalue()
-
-
-# --------------------------------------------------------------------------
-# Streamlit UI
-# --------------------------------------------------------------------------
-
-def render_upload_section() -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("📁 File 1 — Room Temperature Alarms")
-        rt_file = st.file_uploader("Upload Room Temperature Excel file", type=["xlsx", "xls"], key="rt_file")
-
-    with col2:
-        st.subheader("📁 File 2 — Mains Fail Alarms")
-        mf_file = st.file_uploader("Upload Mains Fail Excel file", type=["xlsx", "xls"], key="mf_file")
-
-    rt_df, mf_df = None, None
-
-    if rt_file is not None:
-        rt_df = load_excel(rt_file.getvalue(), rt_file.name)
-
-    if mf_file is not None:
-        mf_df = load_excel(mf_file.getvalue(), mf_file.name)
-
-    return rt_df, mf_df
-
-
-def render_validation(rt_df: pd.DataFrame, mf_df: pd.DataFrame) -> bool:
-    ok = True
-
-    missing_rt = validate_columns(rt_df, REQUIRED_COLUMNS)
-    missing_mf = validate_columns(mf_df, REQUIRED_COLUMNS)
-
-    if missing_rt:
-        st.error(f"❌ Room Temperature file is missing required columns: {', '.join(missing_rt)}")
-        ok = False
-    if missing_mf:
-        st.error(f"❌ Mains Fail file is missing required columns: {', '.join(missing_mf)}")
-        ok = False
-
-    if ok:
-        st.success("✅ Both files contain all required columns.")
-
-    return ok
-
-
-def render_dashboard(summary_df: pd.DataFrame):
-    total_events = len(summary_df)
-    with_mf = int((summary_df["Mains Fail Occurred"] == "Yes").sum())
-    without_mf = total_events - with_mf
-    pct_with_mf = (with_mf / total_events * 100.0) if total_events > 0 else 0.0
-
-    st.subheader("📊 Summary Dashboard")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Room Temperature Events", f"{total_events:,}")
-    c2.metric("Events with Mains Fail", f"{with_mf:,}")
-    c3.metric("Events without Mains Fail", f"{without_mf:,}")
-    c4.metric("% with Mains Fail", f"{pct_with_mf:.1f}%")
-
-
-def render_filters(summary_df: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("🔍 Filters")
-    f1, f2, f3, f4 = st.columns(4)
-
-    with f1:
-        zones = st.multiselect("Zone", sorted(summary_df["Zone"].dropna().unique().tolist()))
-    with f2:
-        clusters = st.multiselect("Cluster", sorted(summary_df["Cluster"].dropna().unique().tolist()))
-    with f3:
-        tenants = st.multiselect("Tenant", sorted(summary_df["Tenant"].dropna().unique().tolist()))
-    with f4:
-        sites = st.multiselect("Site", sorted(summary_df["Site"].dropna().unique().tolist()))
-
-    search_text = st.text_input("Search Site / Site Alias", placeholder="Type to search...")
-
-    return apply_filters(summary_df, zones, clusters, tenants, sites, search_text)
-
-
-def main():
-    st.title("🛰️ RMS Alarm History Comparator")
-    st.caption(
-        "Compare Room Temperature alarm events against Mains Fail alarm events "
-        "using overlapping time-interval logic."
-    )
-
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        site_key_choice = st.radio(
-            "Match events by:",
-            options=["Site", "Site Alias"],
-            index=0,
-            help="Choose whether to match Room Temperature and Mains Fail events using the Site or the Site Alias column.",
-        )
-        st.markdown("---")
-        st.markdown(
-            "**How it works**\n\n"
-            "Two events overlap when:\n\n"
-            "`MF Start Time <= RT End Time`\n\n"
-            "`AND`\n\n"
-            "`MF End Time >= RT Start Time`"
-        )
-
-    rt_df_raw, mf_df_raw = render_upload_section()
-
-    if rt_df_raw is None or mf_df_raw is None:
-        st.info("⬆️ Please upload both the Room Temperature and Mains Fail Excel files to begin.")
-        return
-
-    st.markdown("---")
-    st.subheader("✅ Validation")
-    if not render_validation(rt_df_raw, mf_df_raw):
-        return
-
-    with st.spinner("Converting date/time columns..."):
-        rt_df, rt_issues = preprocess_dataframe(rt_df_raw, "RT")
-        mf_df, mf_issues = preprocess_dataframe(mf_df_raw, "MF")
-
-    dropped_rt = rt_issues.get("RT_dropped_rows", 0)
-    dropped_mf = mf_issues.get("MF_dropped_rows", 0)
-    if dropped_rt or dropped_mf:
-        st.warning(
-            f"⚠️ Dropped {dropped_rt:,} Room Temperature row(s) and {dropped_mf:,} Mains Fail row(s) "
-            "due to unparseable Start/End Time values."
-        )
-
-    if rt_df.empty:
-        st.error("No valid Room Temperature rows remain after cleaning. Please check the file.")
-        return
-
-    st.markdown("---")
-    st.subheader("⏳ Processing")
-    progress_bar = st.progress(0.0, text="Comparing events...")
-
-    def update_progress(fraction: float):
-        progress_bar.progress(min(fraction, 1.0), text=f"Comparing events... {fraction * 100:.0f}%")
-
-    summary_df, detail_df = compare_alarms(
-        rt_df, mf_df, site_key=site_key_choice, progress_callback=update_progress
-    )
-    progress_bar.progress(1.0, text="Comparison complete ✅")
-
-    st.markdown("---")
-    render_dashboard(summary_df)
-
-    st.markdown("---")
-    filtered_summary = render_filters(summary_df)
-
-    st.markdown("---")
-    st.subheader(f"📋 Comparison Report ({len(filtered_summary):,} of {len(summary_df):,} events)")
-    st.dataframe(filtered_summary, use_container_width=True, height=420)
-
-    # Filter detail rows to match the filtered summary (by RT start/site combo)
-    if not detail_df.empty:
-        key_cols = ["Site", "Room Temperature Start Time", "Room Temperature End Time"]
-        keys = filtered_summary[key_cols].drop_duplicates()
-        filtered_detail = detail_df.merge(keys, on=key_cols, how="inner")
-    else:
-        filtered_detail = detail_df
-
-    with st.expander(f"🔎 View Overlapping Mains Fail Event Details ({len(filtered_detail):,} pairs)"):
-        st.dataframe(filtered_detail, use_container_width=True, height=350)
-
-    st.markdown("---")
-    st.subheader("⬇️ Export")
-    excel_bytes = to_excel_bytes(filtered_summary, filtered_detail)
-    st.download_button(
-        label="Download Comparison Report (Excel)",
-        data=excel_bytes,
-        file_name=f"rms_alarm_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-if __name__ == "__main__":
-    main()
+            # Perform cross join
+            # We'll add a temporary key
+            rt_group_temp = rt_group.copy()
+            mf_group_temp = mf_group.copy()
+            rt_group_temp['_key'] = 1
+            mf_group_temp['_key'] = 1
+            merged = pd.merge(rt_group_temp, mf_group_temp, on='_key', suffixes=('_rt', '_mf'))
+            merged.drop('_key', axis=1, inplace=True)
+            
+            # Filter by overlap condition
+            merged = merged[
+                (merged['Start Time_mf'] <= merged['End Time_rt']) &
+                (merged['End Time_mf'] >= merged['Start Time_rt'])
+            ]
+            
+            # If no overlaps
+            if merged.empty:
+                for _, row in rt_group.iterrows():
+                    summary_rows.append({
+                        'rt_id': row['rt_id'],
+                        'MF Occurred': 'No',
+                        'MF Count': 0,
+                        'Total Overlap Duration (Hr.)': 0,
+                        'Coverage %': 0,
+                    })
+            else:
+                # Now we need to aggregate per rt_id
+                # For each rt_id, collect list of (start_mf, end_mf)
+                # Also compute union overlap duration
+                # We'll group by rt_id
+                for rt_id, group in merged.groupby('rt_id'):
+                    # Get the RT row info (we can get first row of group which has RT info)
+                    rt_row = group.iloc[0]  # all have same RT info
+                    # Collect MF intervals
+                    intervals = list(zip(group['Start Time_mf'], group['End Time_mf']))
+                    # Compute union overlap
+                    overlap_hours = compute_union_overlap(intervals)
+                    # Compute RT duration (in hours)
+                    rt_duration = (rt_row['End Time_rt'] - rt_row['Start Time_rt']).total_seconds() / 3600.0
+                    coverage_pct = (overlap_hours / rt_duration) * 100 if rt_duration > 0 else 0
+                    
+                    # Add summary row
+                    summary_rows.append({
+                        'rt_id': rt_id,
+                        'MF Occurred': 'Yes',
+                        'MF Count': len(group),
+                        'Total Overlap Duration (Hr.)': overlap_hours,
+                        'Coverage %': coverage_pct,
+                    })
+                    
+                    # Add detail rows for each overlapping MF event
+                    for _, mf_row in group.iterrows():
+                        detail_rows.append({
+                            'rt_id': rt_id,
+                            'MF Start Time': mf_row['Start Time_mf'],
+                            'MF End Time': mf_row['End Time_mf'],
+                            'MF Duration (Hr.)': mf_row['Duration (Hr.)_mf'],
+                        })
+                
+                # For RT events that have no overlap, they won't appear in merged.
+                # We need to add summary rows for those with count 0.
+                all_rt_ids = set(rt_group['rt_id'])
+                overlapped_ids = set(merged['rt_id'])
+                no_overlap_ids = all_rt_ids - overlapped_ids
+                for rid in no_overlap_ids:
+                    summary_rows.append({
+                        'rt_id': rid,
+                        'MF Occurred': 'No',
+                        'MF Count': 0,
+                        'Total Overlap Duration (Hr.)': 0,
+                        'Coverage %': 0,
+                    })
+        
+        progress_bar.progress((idx+1)/total_groups)
+    
+    status_text.empty()
+    progress_bar.empty()
+    
+    # Create summary dataframe from summary_rows
+    summary_df = pd.DataFrame(summary_rows)
+    # Merge with original RT to get all columns
+    # We need to merge on rt_id
+    rt_with_id = rt.reset_index(drop=True)  # ensure rt_id is present
+    summary_df = pd.merge(rt_with_id, summary_df, on='rt_id', how='left')
+    # Fill missing if any (shouldn't)
+    summary_df['MF Occurred'] = summary_df['MF Occurred'].fillna('No')
+    summary_df['MF Count'] = summary_df['MF Count'].fillna(0)
+    summary_df['Total Overlap Duration (Hr.)'] = summary_df['Total Overlap Duration (Hr.)'].fillna(0)
+    summary_df['Coverage %'] = summary_df['Coverage %'].fillna(0)
+    
+    # Create details dataframe
+    details_df = pd.DataFrame(detail_rows)
+    
+    return summary_df, details_df
